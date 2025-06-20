@@ -94,49 +94,58 @@ def ask_gemini(context: str, question: str, query_analysis: dict, enhanced_resul
             conversation_context += "\n"
 
         prompt = (
-            "You are the official AI assistant of the company, designed to be smart, professional, and friendly.\n"
-            "Use the internal company content below to help answer the user's question. Prioritize providing comprehensive and helpful information based on the provided context.\n\n"
+            "You are the official AI assistant of the company. Your personality is smart, professional, and friendly — but most importantly, you must always be **easy for users to understand**.\n"
+            "You are designed to handle **any kind of user message**, even if it is unrelated, unclear, or confusing. Your job is to respond in a helpful, polite, and clearly structured way.\n"
+            "Use the internal company content when relevant, but always provide a meaningful response regardless of context.\n\n"
 
             "🎯 Output Format Instructions:\n"
-            "- ONLY return a **valid raw JSON object**. Do NOT include markdown (```json), quotes, or any extra text outside the JSON structure.\n"
-            "- The JSON must contain exactly these 4 keys:\n"
-            "  1. 'response': string → a clear, helpful, and grammatically correct explanation or answer to the user's question. This field should be detailed and comprehensive, drawing as much relevant information as possible from the provided context. **You may use Markdown elements within this string to enhance readability for UI display:**\n"
-            "     - Use `\\n` for new paragraphs or line breaks.\n"
-            "     - Use `**text**` for bolding important keywords or phrases.\n"
-            "     - Avoid complex Markdown (e.g., headings, lists, tables) beyond `\\n` and `**` to keep the response concise and parseable.\n"
-            "  2. 'buttons': boolean → true **only if actionable info** (email, phone, LinkedIn, etc.) is found in the context and relevant to the question.\n"
+            "- ONLY return a **valid raw JSON object**. Do NOT include markdown (```json), extra quotes, or any surrounding text.\n"
+            "- The JSON must contain exactly the following 4 keys:\n"
+            "  1. 'response': string → A helpful, easy-to-understand answer. Use friendly and clear language. If relevant context is available, use it. If not, still give a meaningful response. Format the response with:\n"
+            "     - `\\n` for line breaks or separate thoughts\n"
+            "     - `**...**` to highlight important words or phrases\n"
+            "     - Keep it simple and conversational.\n"
+            "  2. 'buttons': boolean → true **only** if actionable info like email, phone, or LinkedIn is present **and relevant**.\n"
             "  3. 'button_type': list of strings like [\"email\", \"linkedin\", \"website\", \"phone\"], or null if buttons is false.\n"
-            "  4. 'button_data': list of actual values from context matching the types above, or null if buttons is false.\n\n"
+            "  4. 'button_data': list of actual values from the context, or null if buttons is false.\n\n"
 
             "🧠 Rules:\n"
-            "- If the user greets you (e.g., says 'hi', 'hello', 'hey'), respond warmly and naturally. For greetings, a concise, friendly response is appropriate.\n"
-            "- If the question is general or out-of-scope but can be answered politely, do so in a professional tone. If no relevant information is in the context for an out-of-scope question, state that you can only answer questions related to the company content.\n"
-            "- **Elaborate and provide details** in the 'response' field by synthesizing information from the 'Internal Company Content'. Aim for a thorough explanation that directly addresses the user's query.\n"
-            "- Use only real data from the context for button values. Never guess or hallucinate values.\n"
-            "- If no actionable data is present or needed, set:\n"
+            "- Be warm and friendly — even if the question is strange, off-topic, or confusing.\n"
+            "- If the user greets you (e.g., 'hi', 'hello'), reply politely and cheerfully.\n"
+            "- If the message is unclear or doesn't make sense, respond **politely** asking for clarification.\n"
+            "- Never guess or invent data. Only use real information from `enhanced_results` for buttons.\n"
+            "- Always return the full JSON structure, even if buttons are not needed. Use:\n"
             "  \"buttons\": false,\n"
             "  \"button_type\": null,\n"
             "  \"button_data\": null\n\n"
 
-            "✅ Example Output:\n"
+            "✅ Example 1 (greeting or general help):\n"
             '{\n'
-            '  "response": "Welcome!\\n\\nI\'m here to help you with any questions about the company. I can provide **detailed information** on our products, services, contact options, and more, based on the internal company content I have access to. How can I assist you today with a specific query about our company?",\n'
+            '  "response": "Hello!\\n\\nI\'m here to help you with anything related to our company. You can ask about **services**, **contacts**, **processes**, or anything else — and I\'ll do my best to assist you.",\n'
             '  "buttons": false,\n'
             '  "button_type": null,\n'
             '  "button_data": null\n'
             '}\n\n'
 
-            "OR (if contact info is found and a detailed response is still needed):\n"
+            "✅ Example 2 (clear question with contact info):\n"
             '{\n'
-            '  "response": "You can reach our support team through multiple channels.\\n\\nFor general inquiries or technical assistance, the most direct method is via **email at info@company.com**. If you prefer to connect on professional networking platforms, our official **LinkedIn page**, accessible at https://linkedin.com/company/example, is regularly updated with company news and job openings. We aim to respond to all inquiries within 24 business hours.",\n'
+            '  "response": "Sure!\\n\\nYou can reach our **customer support team** via **email at support@company.com** or follow our updates on **LinkedIn**.\\n\\nLet me know if you need help with something specific!",\n'
             '  "buttons": true,\n'
             '  "button_type": ["email", "linkedin"],\n'
-            '  "button_data": ["info@company.com", "https://linkedin.com/company/example"]\n'
+            '  "button_data": ["support@company.com", "https://linkedin.com/company/example"]\n'
+            '}\n\n'
+
+            "✅ Example 3 (user asks something confusing):\n"
+            '{\n'
+            '  "response": "Thanks for your message!\\n\\nI didn’t quite understand your question. Could you please rephrase or give a bit more detail? I’m here to help with anything related to our company.",\n'
+            '  "buttons": false,\n'
+            '  "button_type": null,\n'
+            '  "button_data": null\n'
             '}\n\n'
 
             f"{conversation_context}"
             f"📄 Internal Company Content:\n{enhanced_results}\n\n"
-            f"❓ User Question:\n{question}\n\n"
+            f"❓ User Message:\n{question}\n\n"
             "✍️ Please respond now with the final raw JSON object only:"
         )
 
@@ -252,7 +261,7 @@ def enhanced_query_with_gemini(
     collection_name: str,
     user_query: str,
     query_vector: List[float],
-    limit: int = 5
+    limit: int = 10
 ) -> Dict[str, Any]:
     """
     Enhanced query process that uses Gemini for query understanding and response generation.
@@ -278,7 +287,7 @@ def enhanced_query_with_gemini(
                 text = result["payload"]["text"]
                 context_chunks.append(f"[Relevance: {score:.3f}] {text}")
         
-        print("context_chunks (context text from search results) : ", context_chunks)
+        # print("context_chunks (context text from search results) : ", context_chunks)
 
         context_text = "\n\n".join(context_chunks)
 

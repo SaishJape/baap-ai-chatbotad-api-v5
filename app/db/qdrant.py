@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, OptimizersConfigDiff, CollectionStatus
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 import logging
 import os
 from dotenv import load_dotenv
@@ -9,6 +9,7 @@ import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 import google.generativeai as genai
 import json
+import threading
 
 load_dotenv()
 
@@ -18,6 +19,51 @@ logger = logging.getLogger(__name__)
 
 # Configure Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Global cancellation tracking
+cancellation_requests = {}
+cancellation_lock = threading.RLock()
+
+scraping_progress = {}
+progress_lock = threading.Lock()
+
+def update_progress(task_id: str, status: str, **kwargs):
+    """Update progress for async tasks (non-thread-safe version)."""
+    if task_id in scraping_progress:
+        scraping_progress[task_id].update({
+            "status": status,
+            "last_update": datetime.now(),
+            "is_completed": status in ["completed", "error", "cancelled"],
+            **kwargs
+        })
+        
+        # Set error field if provided
+        if "error" in kwargs:
+            scraping_progress[task_id]["error"] = kwargs["error"]
+        
+        # Set result field if provided
+        if "result" in kwargs:
+            scraping_progress[task_id]["result"] = kwargs["result"]
+
+def request_cancellation(task_id: str):
+    """Request cancellation for a specific task."""
+    with cancellation_lock:
+        cancellation_requests[task_id] = True
+        logger.info(f"Cancellation requested for task: {task_id}")
+
+def is_cancellation_requested(task_id: str) -> bool:
+    """Check if cancellation has been requested for a task."""
+    with cancellation_lock:
+        return cancellation_requests.get(task_id, False)
+
+def clear_cancellation_request(task_id: str):
+    """Clear cancellation request for a task."""
+    with cancellation_lock:
+        cancellation_requests.pop(task_id, None)
+
+class CancellationException(Exception):
+    """Exception raised when a task is cancelled."""
+    pass
 
 def get_qdrant_client() -> QdrantClient:
     """Create and return a Qdrant client with proper configuration for local or hosted setup."""
@@ -77,9 +123,13 @@ except Exception as e:
 VECTOR_SIZE = 384
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def create_collection_if_not_exists(collection_name: str) -> None:
+def create_collection_if_not_exists(collection_name: str, task_id: Optional[str] = None) -> None:
     """Create a Qdrant collection if it doesn't exist."""
     try:
+        # Check for cancellation
+        if task_id and is_cancellation_requested(task_id):
+            raise CancellationException(f"Task {task_id} was cancelled during collection creation")
+        
         # Check if collection exists
         collections = qdrant.get_collections()
         existing_names = [col.name for col in collections.collections]
@@ -124,14 +174,26 @@ def create_collection_if_not_exists(collection_name: str) -> None:
             logger.error(f"Error verifying collection: {e}")
             # Don't raise here, as the collection might still be usable
             
+    except CancellationException:
+        raise
     except Exception as e:
         logger.error(f"Failed to create/verify collection: {e}")
         raise
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def ingest_to_qdrant(collection_name: str, texts: List[str], embeddings: List[List[float]]) -> None:
-    """Ingest text chunks and embeddings into Qdrant."""
+def ingest_to_qdrant(
+    collection_name: str, 
+    texts: List[str], 
+    embeddings: List[List[float]], 
+    task_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None
+) -> None:
+    """Ingest text chunks and embeddings into Qdrant with cancellation support."""
     try:
+        # Check for cancellation at start
+        if task_id and is_cancellation_requested(task_id):
+            raise CancellationException(f"Task {task_id} was cancelled before ingestion started")
+        
         # Validate inputs
         if not texts or not embeddings:
             raise ValueError("Empty texts or embeddings provided")
@@ -145,11 +207,16 @@ def ingest_to_qdrant(collection_name: str, texts: List[str], embeddings: List[Li
                 raise ValueError(f"Invalid embedding dimension at index {i}: {len(embedding)} vs {VECTOR_SIZE}")
         
         # Ensure collection exists
-        create_collection_if_not_exists(collection_name)
+        create_collection_if_not_exists(collection_name, task_id)
         
         # Prepare points with metadata
         points = []
         for i, (text, embedding) in enumerate(zip(texts, embeddings)):
+            # Check for cancellation during point preparation
+            if task_id and is_cancellation_requested(task_id):
+                logger.info(f"Task {task_id} cancelled during point preparation at index {i}")
+                raise CancellationException(f"Task {task_id} was cancelled during point preparation")
+            
             if not text.strip():
                 continue
                 
@@ -161,7 +228,8 @@ def ingest_to_qdrant(collection_name: str, texts: List[str], embeddings: List[Li
                     "metadata": {
                         "chunk_index": i,
                         "text_length": len(text),
-                        "created_at": datetime.now().isoformat()
+                        "created_at": datetime.now().isoformat(),
+                        "task_id": task_id  # Track which task created this data
                     }
                 }
             )
@@ -170,12 +238,20 @@ def ingest_to_qdrant(collection_name: str, texts: List[str], embeddings: List[Li
         if not points:
             raise ValueError("No valid points to insert")
             
-        # Batch process points
+        # Batch process points with cancellation checks
         batch_size = 100
         total_ingested = 0
+        total_batches = (len(points) + batch_size - 1) // batch_size
         
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
+        for batch_idx in range(0, len(points), batch_size):
+            # Check for cancellation before each batch
+            if task_id and is_cancellation_requested(task_id):
+                logger.info(f"Task {task_id} cancelled after ingesting {total_ingested} points")
+                raise CancellationException(f"Task {task_id} was cancelled during batch processing")
+            
+            batch = points[batch_idx:batch_idx + batch_size]
+            current_batch_num = batch_idx // batch_size + 1
+            
             try:
                 qdrant.upsert(
                     collection_name=collection_name,
@@ -184,22 +260,164 @@ def ingest_to_qdrant(collection_name: str, texts: List[str], embeddings: List[Li
                     ordering=None  # No specific ordering required
                 )
                 total_ingested += len(batch)
-                logger.info(f"Successfully ingested batch {i//batch_size + 1} ({len(batch)} points)")
+                logger.info(f"Successfully ingested batch {current_batch_num}/{total_batches} ({len(batch)} points)")
+                
+                # Call progress callback if provided
+                if progress_callback:
+                    progress_callback(total_ingested, len(points))
+                
             except Exception as e:
-                logger.error(f"Failed to ingest batch {i//batch_size + 1}: {e}")
+                logger.error(f"Failed to ingest batch {current_batch_num}: {e}")
                 # Continue with next batch instead of raising
                 continue
                 
         if total_ingested == 0:
             raise Exception("Failed to ingest any points")
             
-        logger.info(f"Successfully ingested {total_ingested} points to collection {collection_name}")
+        logger.info(f"Successfully ingested {total_ingested}/{len(points)} points to collection {collection_name}")
         
+        # Clear cancellation request if task completed successfully
+        if task_id:
+            clear_cancellation_request(task_id)
+        
+    except CancellationException:
+        # Don't clear cancellation request for cancelled tasks
+        logger.info(f"Ingestion cancelled for task {task_id}")
+        raise
     except Exception as e:
         logger.error(f"Failed to ingest to Qdrant: {e}")
         raise
 
-def query_qdrant(collection_name: str, query_vector: List[float], limit: int = 3) -> List[dict]:
+def ingest_to_qdrant_incremental(
+    collection_name: str, 
+    texts: List[str], 
+    embeddings: List[List[float]], 
+    task_id: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None
+) -> Dict[str, Any]:
+    """
+    Ingest data incrementally with detailed progress tracking and cancellation support.
+    Returns information about what was actually stored.
+    """
+    try:
+        # Check for cancellation at start
+        if is_cancellation_requested(task_id):
+            raise CancellationException(f"Task {task_id} was cancelled before ingestion started")
+        
+        # Validate inputs
+        if not texts or not embeddings:
+            raise ValueError("Empty texts or embeddings provided")
+            
+        if len(texts) != len(embeddings):
+            raise ValueError(f"Mismatched lengths: {len(texts)} texts vs {len(embeddings)} embeddings")
+        
+        # Ensure collection exists
+        create_collection_if_not_exists(collection_name, task_id)
+        
+        # Get current point count in collection to generate unique IDs
+        try:
+            collection_info = qdrant.get_collection(collection_name)
+            start_id = collection_info.points_count if collection_info.points_count else 0
+        except:
+            start_id = 0
+        
+        # Prepare points with unique IDs
+        points = []
+        for i, (text, embedding) in enumerate(zip(texts, embeddings)):
+            # Check for cancellation during point preparation
+            if is_cancellation_requested(task_id):
+                logger.info(f"Task {task_id} cancelled during point preparation at index {i}")
+                break
+            
+            if not text.strip():
+                continue
+                
+            point = PointStruct(
+                id=start_id + i,  # Use unique IDs
+                vector=embedding,
+                payload={
+                    "text": text,
+                    "metadata": {
+                        "chunk_index": i,
+                        "text_length": len(text),
+                        "created_at": datetime.now().isoformat(),
+                        "task_id": task_id
+                    }
+                }
+            )
+            points.append(point)
+        
+        if not points:
+            return {
+                "total_points": 0,
+                "ingested_points": 0,
+                "status": "no_valid_points"
+            }
+        
+        # Batch process points with cancellation checks
+        batch_size = 50  # Smaller batches for better cancellation responsiveness
+        total_ingested = 0
+        
+        for batch_idx in range(0, len(points), batch_size):
+            # Check for cancellation before each batch
+            if is_cancellation_requested(task_id):
+                logger.info(f"Task {task_id} cancelled after ingesting {total_ingested}/{len(points)} points")
+                break
+            
+            batch = points[batch_idx:batch_idx + batch_size]
+            
+            try:
+                qdrant.upsert(
+                    collection_name=collection_name,
+                    points=batch,
+                    wait=True
+                )
+                total_ingested += len(batch)
+                
+                # Update progress
+                if progress_callback:
+                    progress_callback(total_ingested, len(points), f"Stored {total_ingested}/{len(points)} chunks")
+                
+                logger.info(f"Ingested batch: {total_ingested}/{len(points)} points")
+                
+            except Exception as e:
+                logger.error(f"Failed to ingest batch starting at {batch_idx}: {e}")
+                # Continue with next batch
+                continue
+        
+        # Determine final status
+        if is_cancellation_requested(task_id):
+            status = "cancelled"
+            clear_cancellation_request(task_id)  # Clear after partial completion
+        elif total_ingested == len(points):
+            status = "completed"
+            clear_cancellation_request(task_id)
+        else:
+            status = "partial"
+        
+        result = {
+            "total_points": len(points),
+            "ingested_points": total_ingested,
+            "status": status,
+            "collection_name": collection_name
+        }
+        
+        logger.info(f"Ingestion result for task {task_id}: {result}")
+        return result
+        
+    except CancellationException:
+        logger.info(f"Ingestion cancelled for task {task_id}")
+        return {
+            "total_points": len(points) if 'points' in locals() else 0,
+            "ingested_points": total_ingested if 'total_ingested' in locals() else 0,
+            "status": "cancelled",
+            "collection_name": collection_name
+        }
+    except Exception as e:
+        logger.error(f"Failed to ingest to Qdrant: {e}")
+        raise
+
+def query_qdrant(collection_name: str, query_vector: List[float], limit: int = 10) -> List[dict]:
     """Query top relevant chunks from Qdrant using cosine similarity."""
     try:
         hits = qdrant.search(
