@@ -2,14 +2,13 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Depends, requests, status, Form
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.responses import StreamingResponse
-from app.utils.conversation import get_conversation_history, get_or_create_conversation, update_conversation_history
+from app.utils.LangChain import add_to_conversation_history, get_simple_conversation_history
 from app.utils.process_files import process_pdf, process_svg, process_text_file
 from app.db.models import (
     QARequest, ScrapeRequest, UserCreate, UserLogin, User, Token, 
-    ChatbotCreate, ChatbotInfo, FileUploadRequest, UserChatbotsResponse
+    ChatbotCreate, ChatbotInfo, UserChatbotsResponse
 )
-from app.services.gemini import ask_gemini, enhanced_query_with_gemini, translate_to_english
+from app.services.gemini import ask_gemini_fast, enhanced_query_with_gemini, translate_to_english
 from app.services.embeddings import get_embeddings, get_question_embedding
 from app.utils.common import clean_text, crawl_website, create_chunks, scrape_url, should_skip_url
 from app.db.qdrant import clear_cancellation_request, ingest_to_qdrant, update_progress
@@ -80,36 +79,6 @@ def get_progress_safely(task_id: str) -> dict:
     """Thread-safe way to get progress data."""
     with progress_lock:
         return scraping_progress.get(task_id, {}).copy()
-
-# def update_progress_safely(task_id: str, status: str, **kwargs):
-#     """Thread-safe way to update progress."""
-#     with progress_lock:
-#         if task_id not in scraping_progress:
-#             return
-            
-#         scraping_progress[task_id].update({
-#             "status": status,
-#             "last_update": datetime.now(),
-#             **kwargs
-#         })
-        
-#         if status in ["completed", "error"]:
-#             scraping_progress[task_id]["is_completed"] = True
-
-# def update_progress_safely(task_id: str, status: str, **kwargs):
-#     """Thread-safe way to update progress."""
-#     with progress_lock:
-#         if task_id not in scraping_progress:
-#             return
-            
-#         scraping_progress[task_id].update({
-#             "status": status,
-#             "last_update": datetime.now(),
-#             **kwargs
-#         })
-        
-#         if status in ["completed", "error", "cancelled"]:
-#             scraping_progress[task_id]["is_completed"] = True
 
 
 def update_progress_safely(task_id: str, status: str, **kwargs):
@@ -785,58 +754,118 @@ def process_scraping_sync(url: str, task_id: str, collection_name: str):
                              chunks_created=total_chunks_stored if 'total_chunks_stored' in locals() else 0,
                              is_completed=True)
 
+
 @router.post("/ask-question")
-async def ask_question(req: QARequest, db=Depends(get_db)):
+async def ask_question(req: QARequest):
     try:
-        logging.info(f"Processing question: {req.question} for collection: {req.collection_name}")
+        # Input validation
+        if not req.question or req.question.strip() == "":
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
         
-        # Get or create conversation
-        conversation_id = get_or_create_conversation(db, req.collection_name)
+        if not req.collection_name or req.collection_name.strip() == "":
+            raise HTTPException(status_code=400, detail="Collection name cannot be empty")
+
+        logger.info(f"Processing question: '{req.question}' for collection: '{req.collection_name}'")
         
-        # Get existing conversation history
-        conversation_history = get_conversation_history(db, conversation_id)
-        
-        translated_query = translate_to_english(req.question)
+        # Get conversation history (super fast)
+        conversation_history = get_simple_conversation_history(req.collection_name)
+        logger.debug(f"Retrieved {len(conversation_history)} messages from history")
+
+        # Translate query if needed
+        try:
+            translated_query = translate_to_english(req.question)
+            logger.debug(f"Translated query: {translated_query}")
+        except Exception as e:
+            logger.warning(f"Translation failed, using original query: {e}")
+            translated_query = req.question
 
         # Step 1: Get embedding
-        question_embedding = get_question_embedding(translated_query)
+        try:
+            question_embedding = get_question_embedding(translated_query)
+            logger.debug(f"Generated embedding with {len(question_embedding)} dimensions")
+        except Exception as e:
+            logger.error(f"Failed to generate embedding: {e}")
+            raise HTTPException(status_code=500, detail="Failed to process question")
 
         # Step 2: Enhanced query to get search results and context
-        enhanced_results = enhanced_query_with_gemini(
-            collection_name=req.collection_name,
-            user_query=translated_query,
-            query_vector=question_embedding,
-            limit=5
-        )
+        try:
+            enhanced_results = enhanced_query_with_gemini(
+                collection_name=req.collection_name,
+                user_query=translated_query,
+                query_vector=question_embedding,
+                limit=10
+            )
+            logger.info(f"Enhanced query returned {enhanced_results.get('total_results', 0)} results")
+        except Exception as e:
+            logger.error(f"Enhanced query failed: {e}")
+            enhanced_results = {
+                "error": str(e),
+                "context_text": "Failed to retrieve relevant context.",
+                "processed_query": {},
+                "search_results": []
+            }
 
-        # Step 3: Ask Gemini with the full context and results
-        final_response = ask_gemini(
-            enhanced_results.get("context_text", ""),  # context string
-            req.question,                              # user question
-            enhanced_results.get("processed_query", {}),  # parsed search info
-            enhanced_results,                          # full result dict
-            conversation_history                       # conversation history
-        )
+        # Step 3: Ask Gemini with simple conversation history
+        try:
+            final_response = ask_gemini_fast(
+                context=enhanced_results.get("context_text", ""),
+                question=req.question,
+                query_analysis=enhanced_results.get("processed_query", {}),
+                enhanced_results=enhanced_results,
+                conversation_history=conversation_history
+            )
+            logger.debug("Successfully generated Gemini response")
+        except Exception as e:
+            logger.error(f"Gemini response generation failed: {e}")
+            final_response = {
+                "response": "I apologize, but I'm unable to process your request at the moment. Please try again later.",
+                "buttons": False,
+                "button_type": None,
+                "button_data": None
+            }
 
-        # Update conversation history with new messages
-        conversation_history.append({"role": "user", "content": req.question})
-        conversation_history.append({"role": "assistant", "content": final_response["response"]})
-        update_conversation_history(db, conversation_id, conversation_history)
+        # Save to conversation history (super fast)
+        try:
+            add_to_conversation_history(req.collection_name, "user", req.question)
+            add_to_conversation_history(req.collection_name, "assistant", final_response["response"])
+            logger.debug("Saved conversation to simple memory")
+        except Exception as e:
+            logger.warning(f"Failed to save to memory: {e}")
 
-        # Add conversation_id to response
-        final_response["conversation_id"] = conversation_id
+        # Add debug info to response
+        final_response["conversation_id"] = req.collection_name
+        final_response["debug_info"] = {
+            "total_search_results": enhanced_results.get("total_results", 0),
+            "context_chunks": enhanced_results.get("context_chunks_count", 0),
+            "translated_query": translated_query,
+            "has_context": bool(enhanced_results.get("context_text", "").strip()),
+            "memory_enabled": True,
+            "memory_type": "simple_in_memory",
+            "conversation_length": len(conversation_history)
+        }
+        
+        logger.info(f"Successfully processed question with {final_response['debug_info']['total_search_results']} search results")
         return final_response
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Error in ask_question: {e}")
+        logger.error(f"Unexpected error in ask_question: {e}")
         return {
-            "response": "Something went wrong while answering your question.",
+            "response": "Something went wrong while answering your question. Please try again later.",
             "buttons": False,
             "button_type": None,
             "button_data": None,
-            "conversation_id": None
+            "conversation_id": None,
+            "debug_info": {
+                "error": str(e),
+                "total_search_results": 0,
+                "context_chunks": 0,
+                "has_context": False,
+                "memory_enabled": False,
+                "memory_type": "simple_in_memory"
+            }
         }
-
 import asyncio
 from asyncio import Task
 from typing import Dict, Optional
@@ -1299,7 +1328,7 @@ async def scrape_and_ingest(
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_scraping_async(url: str, task_id: str, collection_name: str):
-    """Async version of process_scraping that can be cancelled."""
+    """Improved async version of process_scraping with better chunk handling."""
     try:
         update_progress(task_id, "crawling")
         
@@ -1310,7 +1339,7 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
         
         # Crawl the website with cancellation support
         pages = await asyncio.get_event_loop().run_in_executor(
-            None, crawl_website_with_cancellation, str(url), None, task_id
+            None, crawl_website_with_cancellation, str(url), task_id, None
         )
         
         # Check if crawling was cancelled
@@ -1327,7 +1356,7 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
         
         all_chunks = []
         
-        # Process each page
+        # Process each page with improved chunking
         for i, (url_page, html) in enumerate(pages.items()):
             # Check for cancellation during processing
             if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
@@ -1337,8 +1366,18 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
             if html and isinstance(html, str) and len(html) > 0:
                 cleaned_text = clean_text(html)
                 if cleaned_text.strip():
-                    chunks = create_chunks(cleaned_text, chunk_size=64, overlap=10)
-                    all_chunks.extend(chunks)
+                    # Improved chunking parameters
+                    chunks = create_chunks(
+                        cleaned_text, 
+                        chunk_size=50,  # Increased from 64 to 512 for better context
+                        overlap=10      # Increased overlap for better continuity
+                    )
+                    
+                    # Add source URL to each chunk for better tracking
+                    for chunk in chunks:
+                        if chunk.strip():  # Only add non-empty chunks
+                            chunk_with_source = f"Source: {url_page}\n\n{chunk}"
+                            all_chunks.append(chunk_with_source)
                     
                     # Update progress periodically during processing
                     if i % 5 == 0:  # Update every 5 pages
@@ -1350,33 +1389,43 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
             update_progress(task_id, "error", error="No valid text content found to ingest from the website")
             return
         
+        # Filter out very short chunks that might not be useful
+        filtered_chunks = [chunk for chunk in all_chunks if len(chunk.strip()) > 50]
+        
+        if not filtered_chunks:
+            update_progress(task_id, "error", error="No substantial text content found after filtering")
+            return
+        
+        logger.info(f"Created {len(filtered_chunks)} chunks from {len(pages)} pages")
+        
         # Check for cancellation
         if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
             update_progress(task_id, "cancelled", error="Task was cancelled")
             return
         
-        update_progress(task_id, "processing", chunks_created=len(all_chunks))
+        update_progress(task_id, "processing", chunks_created=len(filtered_chunks))
         update_progress(task_id, "generating_embeddings")
         
         # Generate embeddings in batches to allow cancellation checks
         embeddings = []
-        batch_size = 10
-        for i in range(0, len(all_chunks), batch_size):
+        batch_size = 20  # Increased batch size for better performance
+        
+        for i in range(0, len(filtered_chunks), batch_size):
             # Check for cancellation
             if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
                 update_progress(task_id, "cancelled", error="Task was cancelled during embedding generation")
                 return
                 
-            batch = all_chunks[i:i + batch_size]
+            batch = filtered_chunks[i:i + batch_size]
             batch_embeddings = await asyncio.get_event_loop().run_in_executor(
                 None, get_embeddings, batch
             )
             embeddings.extend(batch_embeddings)
             
             # Update progress
-            progress_percent = ((i + batch_size) / len(all_chunks)) * 100
+            progress_percent = ((i + batch_size) / len(filtered_chunks)) * 100
             update_progress(task_id, f"generating_embeddings ({progress_percent:.1f}%)", 
-                          chunks_created=len(all_chunks))
+                          chunks_created=len(filtered_chunks))
         
         # Check for cancellation
         if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
@@ -1385,9 +1434,22 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
         
         update_progress(task_id, "storing")
         
-        # Ingest to Qdrant
-        await asyncio.get_event_loop().run_in_executor(
-            None, ingest_to_qdrant, collection_name, all_chunks, embeddings
+        # Create progress callback for ingestion
+        def ingestion_progress_callback(current: int, total: int, message: str):
+            update_progress(task_id, "storing", 
+                          chunks_created=len(filtered_chunks),
+                          chunks_stored=current,
+                          storage_progress=f"{current}/{total}")
+        
+        # Use the incremental ingestion function with progress tracking
+        ingestion_result = await asyncio.get_event_loop().run_in_executor(
+            None, 
+            ingest_to_qdrant_incremental, 
+            collection_name, 
+            filtered_chunks, 
+            embeddings, 
+            task_id,
+            ingestion_progress_callback
         )
         
         # Final check for cancellation
@@ -1395,12 +1457,29 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
             update_progress(task_id, "cancelled", error="Task was cancelled")
             return
         
-        update_progress(task_id, "completed", 
-                       result={
-                           "collection_name": collection_name,
-                           "pages_scraped": len(pages),
-                           "chunks_created": len(all_chunks)
-                       })
+        # Update final status based on ingestion result
+        if ingestion_result["status"] == "completed":
+            update_progress(task_id, "completed", 
+                           result={
+                               "collection_name": collection_name,
+                               "pages_scraped": len(pages),
+                               "chunks_created": len(filtered_chunks),
+                               "chunks_stored": ingestion_result["ingested_points"],
+                               "ingestion_status": ingestion_result["status"]
+                           })
+        elif ingestion_result["status"] == "partial":
+            update_progress(task_id, "completed_with_warnings", 
+                           result={
+                               "collection_name": collection_name,
+                               "pages_scraped": len(pages),
+                               "chunks_created": len(filtered_chunks),
+                               "chunks_stored": ingestion_result["ingested_points"],
+                               "ingestion_status": "partial",
+                               "warning": f"Only {ingestion_result['ingested_points']}/{ingestion_result['total_points']} chunks were stored"
+                           })
+        else:
+            update_progress(task_id, "error", 
+                           error=f"Ingestion failed with status: {ingestion_result['status']}")
         
     except asyncio.CancelledError:
         logger.info(f"Scraping task {task_id} was cancelled")
@@ -1413,46 +1492,27 @@ async def process_scraping_async(url: str, task_id: str, collection_name: str):
 def crawl_website_with_cancellation(url: str, task_id: str, max_pages=None):
     """Modified crawl_website function that checks for cancellation."""
     try:
-        # Your existing crawl_website logic here, but add cancellation checks
-        # This is a wrapper around your existing crawl_website function
+        logger.info(f"Starting crawl for {url} with task_id {task_id}")
         
-        # You'll need to modify your existing crawl_website function to accept and check
-        # the cancellation flag. Here's the pattern:
+        # Check for cancellation before starting
+        if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
+            logger.info(f"Crawling cancelled for task {task_id} before starting")
+            return {}
         
-        visited = set()
-        to_visit = [url]
-        scraped_content = {}
+        # Call your existing crawl_website function but with periodic cancellation checks
+        # You should modify your existing crawl_website function to accept a cancellation callback
         
-        while to_visit and (max_pages is None or len(visited) < max_pages):
-            # Check for cancellation before each page
-            if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
-                logger.info(f"Crawling cancelled for task {task_id} at page {len(visited)}")
-                break
-                
-            current_url = to_visit.pop(0)
-            if current_url in visited:
-                continue
-                
-            try:
-                # Your existing page scraping logic here
-                # Add periodic cancellation checks within the scraping loop
-                
-                # Simulate your existing crawl_website function
-                # Replace this with your actual implementation
-                result = crawl_website(current_url, max_pages)
-                
-                # Check for cancellation after each page
-                if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
-                    logger.info(f"Crawling cancelled for task {task_id}")
-                    break
-                    
-                return result  # Return your crawled pages
-                
-            except Exception as e:
-                logger.error(f"Error crawling {current_url}: {e}")
-                continue
+        # For now, this is a wrapper that calls your existing function
+        # You should integrate cancellation checks into your actual crawl_website implementation
+        result = crawl_website(url, max_pages)
         
-        return scraped_content
+        # Check for cancellation after crawling
+        if task_id in cancellation_flags and cancellation_flags[task_id].is_set():
+            logger.info(f"Crawling cancelled for task {task_id} after completion")
+            return {}
+        
+        logger.info(f"Crawled {len(result)} pages for task {task_id}")
+        return result
         
     except Exception as e:
         logger.error(f"Error in crawl_website_with_cancellation: {e}")

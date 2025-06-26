@@ -19,16 +19,10 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=api_key)
 
-# def translate_to_english(user_query: str) -> str:
-#     model = genai.GenerativeModel("gemini-2.0-flash")
-#     prompt = f"Translate the following into English:\n\n{user_query}"
-#     response = model.generate_content(prompt)
-#     return response.text.strip()
-
 import google.generativeai as genai
 
 # Make sure to configure your API key before calling the function, e.g.:
-genai.configure(api_key="AIzaSyCo2Hhvv_Qs1O52jGj7EMXL1Ve4HgaOLyM")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 def translate_to_english(user_query: str) -> str:
     """
@@ -77,103 +71,133 @@ def translate_to_english(user_query: str) -> str:
         return "" # Return an empty string on error
 
 
-def ask_gemini(context: str, question: str, query_analysis: dict, enhanced_results: dict, conversation_history: Optional[List[Dict[str, str]]] = None) -> dict:
-    """Ask Gemini and return a structured JSON response with optional buttons."""
-
+def ask_gemini_fast(
+    context: str, 
+    question: str, 
+    query_analysis: dict, 
+    enhanced_results: dict, 
+    conversation_history: List[Dict]
+) -> dict:
+    """Ask Gemini with simple conversation history (ultra-fast)."""
+    
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
 
-        # Format conversation history if available
+        # Build conversation context quickly
         conversation_context = ""
-        if conversation_history:
+        is_first_message = len(conversation_history) == 0
+        
+        if not is_first_message and conversation_history:
             conversation_context = "Previous conversation:\n"
-            for msg in conversation_history:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                conversation_context += f"{role.capitalize()}: {content}\n"
+            # Only use last 6 messages (3 exchanges) to keep it fast
+            recent_messages = conversation_history[-6:]
+            
+            for msg in recent_messages:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                conversation_context += f"{role}: {msg['content']}\n"
             conversation_context += "\n"
 
+        # Ensure context is not empty
+        if not context or context.strip() == "":
+            context = "No specific context available from internal documents."
+
+        # Dynamic greeting logic (simplified)
+        if is_first_message:
+            greeting_instruction = (
+                "🎯 FIRST MESSAGE RULES:\n"
+                "- Simple greetings (hi, hello) → 'Hello! How can I help you today?'\n"
+                "- Specific questions → Brief friendly acknowledgment + direct answer\n"
+                "- Business questions → 'Hello! I'm here to help with information about our company.'\n\n"
+            )
+        else:
+            greeting_instruction = (
+                "🎯 FOLLOW-UP RULES:\n"
+                "- NO greetings or introductions\n"
+                "- Answer directly based on conversation context\n\n"
+            )
+
+        # Simplified prompt for faster processing
         prompt = (
-            "You are the official AI assistant of the company. Your personality is smart, professional, and friendly — but most importantly, you must always be **easy for users to understand**.\n"
-            "You are designed to handle **any kind of user message**, even if it is unrelated, unclear, or confusing. Your job is to respond in a helpful, polite, and clearly structured way.\n"
-            "Use the internal company content when relevant, but always provide a meaningful response regardless of context.\n\n"
+            "You are the AI assistant for The Baap Company. Be smart, professional, and friendly.\n"
+            "Respond helpfully to any message. Use company content when relevant.\n\n"
 
-            "🎯 Output Format Instructions:\n"
-            "- ONLY return a **valid raw JSON object**. Do NOT include markdown (```json), extra quotes, or any surrounding text.\n"
-            "- The JSON must contain exactly the following 4 keys:\n"
-            "  1. 'response': string → A helpful, easy-to-understand answer. Use friendly and clear language. If relevant context is available, use it. If not, still give a meaningful response. Format the response with:\n"
-            "     - `\\n` for line breaks or separate thoughts\n"
-            "     - `**...**` to highlight important words or phrases\n"
-            "     - Keep it simple and conversational.\n"
-            "  2. 'buttons': boolean → true **only** if actionable info like email, phone, or LinkedIn is present **and relevant**.\n"
-            "  3. 'button_type': list of strings like [\"email\", \"linkedin\", \"website\", \"phone\"], or null if buttons is false.\n"
-            "  4. 'button_data': list of actual values from the context, or null if buttons is false.\n\n"
+            f"{greeting_instruction}"
 
-            "🧠 Rules:\n"
-            "- Be warm and friendly — even if the question is strange, off-topic, or confusing.\n"
-            "- If the user greets you (e.g., 'hi', 'hello'), reply politely and cheerfully.\n"
-            "- If the message is unclear or doesn't make sense, respond **politely** asking for clarification.\n"
-            "- Never guess or invent data. Only use real information from `enhanced_results` for buttons.\n"
-            "- Always return the full JSON structure, even if buttons are not needed. Use:\n"
-            "  \"buttons\": false,\n"
-            "  \"button_type\": null,\n"
-            "  \"button_data\": null\n\n"
+            "📋 OUTPUT FORMAT - Return ONLY valid JSON:\n"
+            "{\n"
+            '  "response": "Your helpful answer with **bold** formatting and \\n for breaks",\n'
+            '  "buttons": true/false,\n'
+            '  "button_type": ["email", "phone"] or null,\n'
+            '  "button_data": ["actual values"] or null\n'
+            "}\n\n"
 
-            "✅ Example 1 (greeting or general help):\n"
-            '{\n'
-            '  "response": "Hello!\\n\\nI\'m here to help you with anything related to our company. You can ask about **services**, **contacts**, **processes**, or anything else — and I\'ll do my best to assist you.",\n'
-            '  "buttons": false,\n'
-            '  "button_type": null,\n'
-            '  "button_data": null\n'
-            '}\n\n'
-
-            "✅ Example 2 (clear question with contact info):\n"
-            '{\n'
-            '  "response": "Sure!\\n\\nYou can reach our **customer support team** via **email at support@company.com** or follow our updates on **LinkedIn**.\\n\\nLet me know if you need help with something specific!",\n'
-            '  "buttons": true,\n'
-            '  "button_type": ["email", "linkedin"],\n'
-            '  "button_data": ["support@company.com", "https://linkedin.com/company/example"]\n'
-            '}\n\n'
-
-            "✅ Example 3 (user asks something confusing):\n"
-            '{\n'
-            '  "response": "Thanks for your message!\\n\\nI didn’t quite understand your question. Could you please rephrase or give a bit more detail? I’m here to help with anything related to our company.",\n'
-            '  "buttons": false,\n'
-            '  "button_type": null,\n'
-            '  "button_data": null\n'
-            '}\n\n'
+            "🎨 FORMATTING RULES FOR RESPONSE:\n"
+            "- Use **bold text** for important keywords, headings, and emphasis\n"
+            "- Use \\n\\n for paragraph breaks (double newline)\n"
+            "- Use \\n for single line breaks\n"
+            "- Use numbered lists: 1. First item\\n2. Second item\\n3. Third item\n"
+            "- Use bullet points: • First point\\n• Second point\\n• Third point\n"
+            "- Use *italic text* for subtle emphasis or quotes\n"
+            "- Use --- for horizontal dividers when separating sections\n"
+            "- Use > for quotes or important notes\n"
+            "- Use `code formatting` for technical terms or specific values\n"
+            "- Use emojis appropriately: ✅ ❌ 📞 📧 🏢 💼 ⭐ 🎯 📋 💡\n"
+            "- Structure long responses with clear sections and headings\n\n"
 
             f"{conversation_context}"
-            f"📄 Internal Company Content:\n{enhanced_results}\n\n"
-            f"❓ User Message:\n{question}\n\n"
-            "✍️ Please respond now with the final raw JSON object only:"
+            f"📄 Company Content:\n{context}\n\n"
+            f"❓ User Question: {question}\n\n"
+            "JSON Response:"
         )
 
+        print("conversation_context:", conversation_context)
+        print("context:", context)
+
+        # Generate response
         response = model.generate_content(prompt)
         text = response.text.strip()
 
-        # Try direct JSON parse
+        # Quick JSON parsing
         try:
-            return json.loads(text)
+            # Try direct parse first
+            parsed_response = json.loads(text)
+            
+            # Validate required keys
+            required_keys = ['response', 'buttons', 'button_type', 'button_data']
+            if all(key in parsed_response for key in required_keys):
+                return parsed_response
+                
         except json.JSONDecodeError:
-            # Try to extract JSON from markdown-like ```json block
+            pass
+
+        # Fallback: Extract JSON from text
+        try:
+            import re
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
             if json_match:
                 cleaned_json = json_match.group()
-                return json.loads(cleaned_json)
-            else:
-                logging.warning("Could not extract valid JSON from Gemini response.")
-                return {
-                    "response": "Sorry, I couldn't generate a valid response.",
-                    "buttons": False,
-                    "button_type": None,
-                    "button_data": None
-                }
+                parsed_response = json.loads(cleaned_json)
+                
+                # Validate required keys
+                required_keys = ['response', 'buttons', 'button_type', 'button_data']
+                if all(key in parsed_response for key in required_keys):
+                    return parsed_response
+        except:
+            pass
+        
+        # Final fallback
+        logger.warning("Could not parse Gemini JSON response, using fallback")
+        return {
+            "response": "I apologize, but I'm having trouble processing your request right now. Please try rephrasing your question.",
+            "buttons": False,
+            "button_type": None,
+            "button_data": None
+        }
 
     except Exception as e:
-        logging.error(f"Gemini error: {e}")
+        logger.error(f"Gemini error: {e}")
         return {
-            "response": "Sorry, an error occurred while processing your request.",
+            "response": "Sorry, an error occurred while processing your request. Please try again later.",
             "buttons": False,
             "button_type": None,
             "button_data": None
@@ -267,41 +291,75 @@ def enhanced_query_with_gemini(
     Enhanced query process that uses Gemini for query understanding and response generation.
     """
     try:
+        # Input validation
+        if not collection_name or not user_query or not query_vector:
+            raise ValueError("Missing required parameters")
+
         # Step 1: Process query with Gemini
-        processed_query = process_query_with_gemini(user_query)
-        logger.debug(f"Processed query: {processed_query}")
+        try:
+            processed_query = process_query_with_gemini(user_query)
+            logger.debug(f"Processed query: {processed_query}")
+        except Exception as e:
+            logger.warning(f"Query processing failed, using original query: {e}")
+            processed_query = {"original_query": user_query}
 
         # Step 2: Perform vector search in Qdrant
-        search_results = query_qdrant(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            limit=limit
-        )
-        logger.debug(f"Search results from Qdrant: {search_results}")
+        try:
+            search_results = query_qdrant(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                limit=limit
+            )
+            logger.debug(f"Found {len(search_results)} search results from Qdrant")
+        except Exception as e:
+            logger.error(f"Qdrant search failed: {e}")
+            search_results = []
 
-        # Step 3: Extract context text from search results
+        # Step 3: Extract and validate context text from search results
         context_chunks = []
-        for result in search_results:
-            if result.get("payload") and result["payload"].get("text"):
-                score = result.get("score", 0)
-                text = result["payload"]["text"]
-                context_chunks.append(f"[Relevance: {score:.3f}] {text}")
-        
-        # print("context_chunks (context text from search results) : ", context_chunks)
+        if search_results:
+            for i, result in enumerate(search_results):
+                try:
+                    # Handle different result structures
+                    payload = result.get("payload", {})
+                    if isinstance(payload, dict):
+                        text = payload.get("text", "")
+                    else:
+                        text = str(payload) if payload else ""
+                    
+                    if text and text.strip():
+                        score = result.get("score", 0.0)
+                        context_chunks.append(f"[Relevance: {score:.3f}] {text.strip()}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing search result {i}: {e}")
+                    continue
 
-        context_text = "\n\n".join(context_chunks)
+        # Create context text
+        if context_chunks:
+            context_text = "\n\n".join(context_chunks)
+            logger.info(f"Generated context with {len(context_chunks)} chunks")
+        else:
+            context_text = "No relevant context found in the knowledge base."
+            logger.warning("No valid context chunks found")
 
-        print("context_text (context text from search results) : ", context_text)
+        print(f"Final context_text: {context_text[:500]}...")  # Print first 500 chars for debugging
 
         return {
             "processed_query": processed_query,
             "search_results": search_results,
-            "context_text": context_text
+            "context_text": context_text,
+            "total_results": len(search_results),
+            "context_chunks_count": len(context_chunks)
         }
 
     except Exception as e:
         logger.error(f"Error in enhanced_query_with_gemini: {e}")
         return {
             "error": str(e),
-            "response": "I apologize, but I encountered an error while processing your query."
+            "processed_query": {"error": "Query processing failed"},
+            "search_results": [],
+            "context_text": "Error occurred while retrieving context.",
+            "total_results": 0,
+            "context_chunks_count": 0
         }
