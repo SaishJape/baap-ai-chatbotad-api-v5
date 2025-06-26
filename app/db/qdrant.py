@@ -1,3 +1,4 @@
+import hashlib
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, OptimizersConfigDiff, CollectionStatus
 from typing import List, Optional, Dict, Any, Callable
@@ -314,14 +315,7 @@ def ingest_to_qdrant_incremental(
         # Ensure collection exists
         create_collection_if_not_exists(collection_name, task_id)
         
-        # Get current point count in collection to generate unique IDs
-        try:
-            collection_info = qdrant.get_collection(collection_name)
-            start_id = collection_info.points_count if collection_info.points_count else 0
-        except:
-            start_id = 0
-        
-        # Prepare points with unique IDs
+        # Generate unique IDs using hash to avoid collisions
         points = []
         for i, (text, embedding) in enumerate(zip(texts, embeddings)):
             # Check for cancellation during point preparation
@@ -332,8 +326,11 @@ def ingest_to_qdrant_incremental(
             if not text.strip():
                 continue
                 
+            # Create unique ID using hash of content + timestamp + index
+            unique_id = hashlib.md5(f"{text[:100]}_{task_id}_{i}_{datetime.now().timestamp()}".encode()).hexdigest()
+            
             point = PointStruct(
-                id=start_id + i,  # Use unique IDs
+                id=unique_id,  # Use hash-based unique IDs
                 vector=embedding,
                 payload={
                     "text": text,
@@ -341,7 +338,8 @@ def ingest_to_qdrant_incremental(
                         "chunk_index": i,
                         "text_length": len(text),
                         "created_at": datetime.now().isoformat(),
-                        "task_id": task_id
+                        "task_id": task_id,
+                        "collection_name": collection_name
                     }
                 }
             )
@@ -355,7 +353,7 @@ def ingest_to_qdrant_incremental(
             }
         
         # Batch process points with cancellation checks
-        batch_size = 50  # Smaller batches for better cancellation responsiveness
+        batch_size = 100  # Increased batch size for better performance
         total_ingested = 0
         
         for batch_idx in range(0, len(points), batch_size):
@@ -376,19 +374,20 @@ def ingest_to_qdrant_incremental(
                 
                 # Update progress
                 if progress_callback:
-                    progress_callback(total_ingested, len(points), f"Stored {total_ingested}/{len(points)} chunks")
+                    progress_message = f"Stored {total_ingested}/{len(points)} chunks in Qdrant"
+                    progress_callback(total_ingested, len(points), progress_message)
                 
                 logger.info(f"Ingested batch: {total_ingested}/{len(points)} points")
                 
             except Exception as e:
                 logger.error(f"Failed to ingest batch starting at {batch_idx}: {e}")
-                # Continue with next batch
+                # Continue with next batch instead of failing completely
                 continue
         
         # Determine final status
         if is_cancellation_requested(task_id):
             status = "cancelled"
-            clear_cancellation_request(task_id)  # Clear after partial completion
+            clear_cancellation_request(task_id)
         elif total_ingested == len(points):
             status = "completed"
             clear_cancellation_request(task_id)
