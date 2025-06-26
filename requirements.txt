@@ -14,43 +14,7 @@ PyPDF2==3.0.1
 requests==2.31.0
 beautifulsoup4==4.12.2
 langchain==0.0.350
+langchain-core==0.1.35
+langchain-community==0.0.21
 tenacity==8.2.3
 aiofiles==23.2.1
-
-
-# # ✅ Core Frameworks
-# fastapi==0.104.1
-# uvicorn[standard]==0.24.0
-
-# # ✅ File Upload & Auth
-# python-multipart==0.0.6
-# python-jose[cryptography]==3.3.0
-# passlib[bcrypt]==1.7.4
-
-# # ✅ Environment & Data Validation
-# python-dotenv==1.0.0
-# pydantic[email]==2.5.0
-
-# # ✅ Database
-# mysql-connector-python==8.2.0
-
-# # ✅ Vector DB & Embeddings
-# qdrant-client==1.7.0
-# sentence-transformers==2.3.1
-
-# # ✅ Google Gemini & Huggingface
-# google-generativeai==0.3.2
-# huggingface_hub==0.20.3
-
-# # ✅ PDF & Web Content Handling
-# PyPDF2==3.0.1
-# requests==2.31.0
-# beautifulsoup4==4.12.2
-
-# # ✅ Langchain & Supporting Tools
-# langchain==0.0.350
-# tenacity==8.2.3
-# aiofiles==23.2.1
-
-# # ✅ Logging & Others (Python Standard)
-# # No need to include `datetime`, `json`, `logging` as they're built-in
