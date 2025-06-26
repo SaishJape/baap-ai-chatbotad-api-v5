@@ -3,7 +3,6 @@ from datetime import datetime
 from langchain.memory import ConversationBufferWindowMemory, ConversationSummaryBufferMemory
 from langchain.schema import BaseMessage, HumanMessage, AIMessage
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_community.chat_message_histories import SQLChatMessageHistory
 from typing import List, Dict, Any, Optional
 import json
 import logging
